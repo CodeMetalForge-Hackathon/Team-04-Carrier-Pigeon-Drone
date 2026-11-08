@@ -1,4 +1,4 @@
-"""Keyboard teleop for the Crazyflie 2.1, with IMU logging to CSV.
+"""Keyboard teleop for the Crazyflie 2.1, with IMU logging to CSV. (Raspberry-Pi ready.)
 
     T           TAKE OFF: spool up to just below lift-off (~1 s), then fine-tune with arrows
     UP / DOWN   tap = thrust +/-2%, hold = smooth ramp   (hover mode: height +/-0.1 m per tap)
@@ -17,16 +17,27 @@ Two modes, picked automatically:
   * MANUAL (no positioning deck): arrows change thrust, WASD = tilt angle.
            Nothing holds it in place - it WILL drift; you are the stabiliser.
 
+Keyboard backend (auto-selected, override with --keys):
+  * pynput   : used on a desktop session (X11/Wayland) with pynput installed. True
+               key-release, so "hold to ramp / release to level" works best.
+  * terminal : used headless / over SSH, or when pynput is missing. Reads this
+               terminal directly (no X needed). Taps work fully; "hold" is emulated
+               from the OS key-repeat and tilt/yaw auto-level shortly after the last
+               keypress. Run it in the terminal that has keyboard focus.
+
 Every run records accelerometer, gyro, attitude, thrust, battery and your commands to
 flights/flight_<date>_<time>.csv  (use --no-log to turn off).
 
-    python cf_keyboard.py --ble F9:C5:66:38:6D:AA --dry-run   # Bluetooth, motors never commanded
-    python cf_keyboard.py --ble F9:C5:66:38:6D:AA             # fly over Bluetooth
-    python cf_keyboard.py                                     # fly over Crazyradio (default URI)
+    python3 cf_keyboard.py --ble F9:C5:66:38:6D:AA --dry-run   # Bluetooth, motors never commanded
+    python3 cf_keyboard.py --ble F9:C5:66:38:6D:AA             # fly over Bluetooth
+    python3 cf_keyboard.py                                     # fly over Crazyradio (default URI)
+    python3 cf_keyboard.py --ble AA:BB.. --keys terminal       # force the SSH/headless backend
 """
 import argparse
 import csv
 import os
+import select
+import sys
 import threading
 import time
 
@@ -34,7 +45,6 @@ import cflib.crtp
 from cflib.crazyflie import Crazyflie
 from cflib.crazyflie.log import LogConfig
 from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
-from pynput import keyboard
 
 RATE_HZ = 20
 DT = 1.0 / RATE_HZ
@@ -97,7 +107,7 @@ class _Rebooted(Exception):
 
 
 class Keys:
-    """Tracks held keys, plus counts of fresh UP/DOWN taps (OS key-repeat ignored)."""
+    """Held-key state + control queries. Backends feed it via _down()/_up()."""
 
     def __init__(self):
         self.held = set()
@@ -108,35 +118,34 @@ class Keys:
         self.land = False
         self.lock = threading.Lock()
 
-    @staticmethod
-    def _name(k):
-        if isinstance(k, keyboard.KeyCode) and k.char:
-            return k.char.lower()
-        return {keyboard.Key.up: "up", keyboard.Key.down: "down",
-                keyboard.Key.space: "space", keyboard.Key.esc: "esc"}.get(k)
-
-    def press(self, k):
-        n = self._name(k)
+    def _down(self, n):
+        if n is None:
+            return
         if n == "esc":
             self.estop = True
-            return False  # stop the listener
+            return
         if n == "space":
             self.land = True
         if n == "t":
             self.spool = True
-        if n:
-            with self.lock:
-                if n not in self.held:
-                    self.pressed_at[n] = time.time()
-                    if n in ("up", "down"):
-                        self.taps += 1 if n == "up" else -1
-                self.held.add(n)
+        with self.lock:
+            if n not in self.held:
+                self.pressed_at[n] = time.time()
+                if n in ("up", "down"):
+                    self.taps += 1 if n == "up" else -1
+            self.held.add(n)
 
-    def release(self, k):
-        n = self._name(k)
-        if n:
-            with self.lock:
-                self.held.discard(n)
+    def _up(self, n):
+        if n is None:
+            return
+        with self.lock:
+            self.held.discard(n)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
 
     def take_taps(self):
         with self.lock:
@@ -154,6 +163,143 @@ class Keys:
             p = pos in self.held and now - self.pressed_at.get(pos, now) > delay
             n = neg in self.held and now - self.pressed_at.get(neg, now) > delay
             return p - n
+
+
+class PynputKeys(Keys):
+    """Desktop backend: real press/release events via pynput (needs X11/Wayland)."""
+
+    def start(self):
+        from pynput import keyboard
+        self._kb = keyboard
+        self._listener = keyboard.Listener(on_press=self._p, on_release=self._r)
+        self._listener.start()
+
+    def _name(self, k):
+        if isinstance(k, self._kb.KeyCode) and k.char:
+            return k.char.lower()
+        return {self._kb.Key.up: "up", self._kb.Key.down: "down",
+                self._kb.Key.space: "space", self._kb.Key.esc: "esc"}.get(k)
+
+    def _p(self, k):
+        n = self._name(k)
+        if n == "esc":
+            self._down("esc")
+            return False  # stop the listener
+        self._down(n)
+
+    def _r(self, k):
+        self._up(self._name(k))
+
+    def stop(self):
+        try:
+            self._listener.stop()
+        except Exception:
+            pass
+
+
+class TerminalKeys(Keys):
+    """Headless/SSH backend: reads this terminal in raw mode. No X server needed.
+
+    stdin gives key *presses* only (no release), so a key is treated as 'held' while
+    the OS key-repeat keeps re-sending it, and auto-released HOLD_TIMEOUT after the
+    last repeat. Thrust taps are exact; tilt/yaw ease back to level on key-up."""
+
+    HOLD_TIMEOUT = 0.22
+
+    def start(self):
+        import termios
+        import tty
+        self._termios = termios
+        self._fd = sys.stdin.fileno()
+        self._old = termios.tcgetattr(self._fd)
+        tty.setcbreak(self._fd)          # no echo, chars available immediately, Ctrl-C still works
+        self._seen = {}
+        self._stop = False
+        threading.Thread(target=self._read_loop, daemon=True).start()
+        threading.Thread(target=self._sweep_loop, daemon=True).start()
+
+    def _tap(self, n):
+        self._down(n)
+        with self.lock:
+            self._seen[n] = time.time()
+
+    def _read_loop(self):
+        while not self._stop:
+            r, _, _ = select.select([self._fd], [], [], 0.1)
+            if not r:
+                continue
+            try:
+                data = os.read(self._fd, 16)
+            except OSError:
+                break
+            self._parse(data)
+
+    def _parse(self, data):
+        i = 0
+        while i < len(data):
+            c = data[i]
+            if c == 0x1b:  # ESC or an escape sequence (arrow keys)
+                if data[i + 1:i + 2] == b"[" and i + 2 < len(data):
+                    n = {65: "up", 66: "down", 67: None, 68: None}.get(data[i + 2])
+                    if n:
+                        self._tap(n)
+                    i += 3
+                    continue
+                self._down("esc")        # bare ESC = emergency stop
+                return
+            ch = chr(c).lower()
+            if c in (10, 13):
+                pass
+            elif ch == " ":
+                self._down("space")
+            elif ch == "t":
+                self._down("t")
+            elif ch in "wasdqe":
+                self._tap(ch)
+            i += 1
+
+    def _sweep_loop(self):
+        while not self._stop:
+            now = time.time()
+            with self.lock:
+                for n in list(self.held):
+                    if now - self._seen.get(n, 0) > self.HOLD_TIMEOUT:
+                        self.held.discard(n)
+            time.sleep(0.03)
+
+    def stop(self):
+        self._stop = True
+        try:
+            self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old)
+        except Exception:
+            pass
+
+
+def _display_available():
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def make_keys(backend):
+    """Return a started Keys backend. 'auto' uses pynput on a desktop, else terminal."""
+    want_pynput = backend == "pynput" or (backend == "auto" and _display_available())
+    if want_pynput:
+        try:
+            import pynput  # noqa: F401
+            k = PynputKeys()
+            k.start()
+            print("Keyboard: pynput (desktop)")
+            return k
+        except Exception as e:
+            if backend == "pynput":
+                raise SystemExit(f"pynput backend requested but unavailable: {e}")
+            print(f"pynput unavailable ({e}); falling back to terminal keys")
+    if not sys.stdin.isatty():
+        raise SystemExit("terminal keyboard backend needs an interactive terminal (a TTY). "
+                         "Run it directly in a terminal, not piped/detached.")
+    k = TerminalKeys()
+    k.start()
+    print("Keyboard: terminal (raw stdin) - keep this terminal focused")
+    return k
 
 
 def ramp(current, target, step):
@@ -291,6 +437,8 @@ def main():
     ap.add_argument("--mode", choices=["auto", "hover", "manual"], default="auto")
     ap.add_argument("--ble", nargs="?", const="scan", metavar="ADDRESS",
                     help="use Bluetooth instead of Crazyradio (optionally give the drone's address)")
+    ap.add_argument("--keys", choices=["auto", "pynput", "terminal"], default="auto",
+                    help="keyboard backend (default auto: pynput on a desktop, terminal over SSH)")
     ap.add_argument("--no-log", action="store_true", help="don't record IMU data to CSV")
     args = ap.parse_args()
 
@@ -298,9 +446,7 @@ def main():
         print("WARNING: flying while tethered by USB is unsafe. Ctrl+C now to abort (3 s)...")
         time.sleep(3)
 
-    keys = Keys()
-    listener = keyboard.Listener(on_press=keys.press, on_release=keys.release)
-    listener.start()
+    keys = make_keys(args.keys)
 
     if args.ble:
         from cf_ble import BleCrazyflie, pick_address
@@ -310,18 +456,20 @@ def main():
     else:
         cflib.crtp.init_drivers()
 
-    for attempt in range(2):          # 2nd pass only if we had to reboot a locked drone
-        if args.ble:
-            session = _BleSession(BleCrazyflie(address))
-        else:
-            session = SyncCrazyflie(args.uri, cf=Crazyflie(rw_cache=os.path.join(HERE, "cache")))
-        try:
-            fly_session(args, keys, session, allow_reboot=(attempt == 0))
-            break
-        except _Rebooted:
-            print("Waiting for the drone to reboot...")
-            time.sleep(6)
-    listener.stop()
+    try:
+        for attempt in range(2):          # 2nd pass only if we had to reboot a locked drone
+            if args.ble:
+                session = _BleSession(BleCrazyflie(address))
+            else:
+                session = SyncCrazyflie(args.uri, cf=Crazyflie(rw_cache=os.path.join(HERE, "cache")))
+            try:
+                fly_session(args, keys, session, allow_reboot=(attempt == 0))
+                break
+            except _Rebooted:
+                print("Waiting for the drone to reboot...")
+                time.sleep(6)
+    finally:
+        keys.stop()
 
 
 def fly_session(args, keys, session, allow_reboot):
